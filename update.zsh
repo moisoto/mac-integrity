@@ -1,0 +1,281 @@
+#!/bin/zsh
+
+setopt ERR_EXIT
+setopt NO_UNSET
+setopt PIPE_FAIL
+
+readonly SCRIPT_DIR="${0:A:h}"
+readonly MANIFEST="${SCRIPT_DIR}/manifest"
+readonly BASELINE="${SCRIPT_DIR}/baseline"
+
+typeset TEMP_BASELINE=""
+typeset -a ENTRIES
+typeset -A SEEN_PATHS
+
+cleanup() {
+    if [[ -n "${TEMP_BASELINE:-}" && -d "$TEMP_BASELINE" ]]; then
+        rm -rf -- "$TEMP_BASELINE"
+    fi
+}
+
+trap cleanup EXIT INT TERM HUP
+
+error() {
+    print -u2 -- "[ERROR] $*"
+}
+
+die() {
+    error "$@"
+    exit 2
+}
+
+# ---------------------------------------------------------------------------
+# Manifest parsing
+# ---------------------------------------------------------------------------
+
+[[ -f "$MANIFEST" ]] ||
+    die "Manifest not found: $MANIFEST"
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+    # Remove leading/trailing whitespace for purposes of recognizing
+    # blank lines and comments.
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+
+    [[ -z "$trimmed" ]] && continue
+    [[ "$trimmed" == \#* ]] && continue
+
+    # The first whitespace-separated token is the entry type.
+    # Everything after it is the path.
+    if [[ "$trimmed" != *[[:space:]]* ]]; then
+        die "Malformed manifest entry: $line"
+    fi
+
+    type="${trimmed%%[[:space:]]*}"
+    target_path="${trimmed#"$type"}"
+
+    # Strip whitespace between the type and path, and trailing whitespace.
+    target_path="${target_path#"${target_path%%[![:space:]]*}"}"
+    target_path="${target_path%"${target_path##*[![:space:]]}"}"
+
+    case "$type" in
+        file|directory|symlink|absent)
+            ;;
+        *)
+            die "Unknown manifest type '$type': $line"
+            ;;
+    esac
+
+    [[ -n "$target_path" ]] ||
+        die "Missing path for '$type' entry"
+
+    [[ "$target_path" == /* ]] ||
+        die "Path must be absolute: $target_path"
+
+    # Tabs/newlines are deliberately unsupported because metadata is
+    # tab-delimited.
+    [[ "$target_path" != *$'\t'* ]] ||
+        die "Path contains a tab: $target_path"
+
+    [[ "$target_path" != *$'\n'* ]] ||
+        die "Path contains a newline"
+
+    # Reject deliberately non-canonical path components rather than silently
+    # interpreting them.
+    if [[ "/$target_path/" == *"/../"* || "/$target_path/" == *"/./"* ]]; then
+        die "Path contains '.' or '..' components: $target_path"
+    fi
+
+    # Avoid multiple manifest rules referring to the same path.
+    if (( ${+SEEN_PATHS[$target_path]} )); then
+        die "Duplicate manifest path: $target_path"
+    fi
+
+    SEEN_PATHS[$target_path]=1
+    ENTRIES+=("${type}"$'\t'"${target_path}")
+done < "$MANIFEST"
+
+# ---------------------------------------------------------------------------
+# Validate the current filesystem state
+#
+# Do this before creating or modifying any baseline data.
+# ---------------------------------------------------------------------------
+
+for entry in "${ENTRIES[@]}"; do
+    type="${entry%%$'\t'*}"
+    target_path="${entry#*$'\t'}"
+
+    case "$type" in
+        file)
+            if [[ -L "$target_path" ]]; then
+                die "Expected regular file but found symlink: $target_path"
+            elif [[ ! -e "$target_path" ]]; then
+                die "File does not exist: $target_path"
+            elif [[ ! -f "$target_path" ]]; then
+                die "Expected regular file: $target_path"
+            elif [[ ! -r "$target_path" ]]; then
+                die "File is not readable: $target_path"
+            fi
+            ;;
+
+        directory)
+            if [[ -L "$target_path" ]]; then
+                die "Expected directory but found symlink: $target_path"
+            elif [[ ! -e "$target_path" ]]; then
+                die "Directory does not exist: $target_path"
+            elif [[ ! -d "$target_path" ]]; then
+                die "Expected directory: $target_path"
+            fi
+            ;;
+
+        symlink)
+            # -L also succeeds for broken symlinks, which is intentional.
+            [[ -L "$target_path" ]] ||
+                die "Expected symbolic link: $target_path"
+            ;;
+
+        absent)
+            # -e alone does not detect a broken symlink.
+            if [[ -e "$target_path" || -L "$target_path" ]]; then
+                die "Path is expected to be absent but exists: $target_path"
+            fi
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Create the new baseline in a temporary directory.
+#
+# It is deliberately created next to baseline/ so the final rename occurs
+# within the same filesystem.
+# ---------------------------------------------------------------------------
+
+TEMP_BASELINE="$(mktemp -d "${SCRIPT_DIR}/.baseline.tmp.XXXXXXXX")" ||
+    die "Could not create temporary baseline"
+
+readonly METADATA="${TEMP_BASELINE}/metadata"
+
+{
+    print -r -- "# Generated by mac-integrity update.zsh."
+    print -r -- "# Do not edit manually."
+    print -r -- "#"
+    print -r -- $'# type\tpath\towner\tgroup\tmode-or-target'
+} > "$METADATA"
+
+print -- "Capturing integrity baseline..."
+print
+
+# ---------------------------------------------------------------------------
+# Capture
+# ---------------------------------------------------------------------------
+
+for entry in "${ENTRIES[@]}"; do
+    type="${entry%%$'\t'*}"
+    target_path="${entry#*$'\t'}"
+
+    case "$type" in
+        file)
+            owner="$(stat -f '%Su' -- "$target_path")"
+            group="$(stat -f '%Sg' -- "$target_path")"
+            mode="$(stat -f '%Lp' -- "$target_path")"
+
+            # Normalize to four octal digits.
+            printf -v mode '%04d' "$mode"
+
+            destination="${TEMP_BASELINE}${target_path}"
+            mkdir -p -- "${destination:h}"
+            cp -p -- "$target_path" "$destination"
+
+            print -r -- \
+                "${type}"$'\t'"${target_path}"$'\t'"${owner}"$'\t'"${group}"$'\t'"${mode}" \
+                >> "$METADATA"
+
+            printf '[OK] %-9s %s\n' "file" "$target_path"
+            ;;
+
+        directory)
+            owner="$(stat -f '%Su' -- "$target_path")"
+            group="$(stat -f '%Sg' -- "$target_path")"
+            mode="$(stat -f '%Lp' -- "$target_path")"
+
+            printf -v mode '%04d' "$mode"
+
+            print -r -- \
+                "${type}"$'\t'"${target_path}"$'\t'"${owner}"$'\t'"${group}"$'\t'"${mode}" \
+                >> "$METADATA"
+
+            printf '[OK] %-9s %s\n' "directory" "$target_path"
+            ;;
+
+        symlink)
+            # -h tells macOS stat to inspect the link rather than its target.
+            owner="$(stat -f '%Su' -- "$target_path")"
+            group="$(stat -f '%Sg' -- "$target_path")"
+            target="$(readlink -- "$target_path")"
+
+            [[ "$target" != *$'\t'* && "$target" != *$'\n'* ]] ||
+                die "Symlink target contains unsupported characters: $target_path"
+
+            print -r -- \
+                "${type}"$'\t'"${target_path}"$'\t'"${owner}"$'\t'"${group}"$'\t'"${target}" \
+                >> "$METADATA"
+
+            printf '[OK] %-9s %s\n' "symlink" "$target_path"
+            ;;
+
+        absent)
+            # No metadata is necessary: the manifest itself completely
+            # describes the expected state.
+            printf '[OK] %-9s %s\n' "absent" "$target_path"
+            ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Commit the newly generated baseline.
+#
+# Keep a temporary reference to the previous baseline so that a failure
+# during replacement cannot destroy it.
+# ---------------------------------------------------------------------------
+
+OLD_BASELINE=""
+
+if [[ -e "$BASELINE" || -L "$BASELINE" ]]; then
+    [[ -d "$BASELINE" && ! -L "$BASELINE" ]] ||
+        die "Baseline path exists but is not a directory: $BASELINE"
+
+    OLD_BASELINE="${SCRIPT_DIR}/.baseline.old.$$"
+
+    [[ ! -e "$OLD_BASELINE" && ! -L "$OLD_BASELINE" ]] ||
+        die "Temporary backup path already exists: $OLD_BASELINE"
+
+    mv -- "$BASELINE" "$OLD_BASELINE"
+fi
+
+if ! mv -- "$TEMP_BASELINE" "$BASELINE"; then
+    error "Could not install new baseline."
+
+    if [[ -n "$OLD_BASELINE" && -d "$OLD_BASELINE" ]]; then
+        mv -- "$OLD_BASELINE" "$BASELINE" ||
+            error "CRITICAL: Could not restore previous baseline."
+    fi
+
+    exit 2
+fi
+
+TEMP_BASELINE=""
+
+if [[ -n "$OLD_BASELINE" ]]; then
+    rm -rf -- "$OLD_BASELINE"
+fi
+
+print
+print -- "Baseline updated successfully."
+
+if command -v git >/dev/null 2>&1 &&
+   git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    print
+    print -- "Review changes with:"
+    print
+    print -- "    git -C ${(q)SCRIPT_DIR} diff -- baseline/"
+fi

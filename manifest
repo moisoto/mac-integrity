@@ -1,0 +1,7 @@
+file /etc/zshrc
+file /etc/zprofile
+absent /etc/zlogin
+absent /etc/zshenv
+
+directory /Library/Application Support/Apple
+symlink /etc
