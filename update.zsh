@@ -275,7 +275,7 @@ print -- "Baseline updated successfully."
 if command -v git >/dev/null 2>&1 &&
    git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     print
-    print -- "Review changes with:"
+    print -- "To review the changes, run from the repository:"
     print
-    print -- "    git -C ${(q)SCRIPT_DIR} diff -- baseline/"
+    print -- "    git diff -- baseline/"
 fi
